@@ -28,7 +28,7 @@ final class NetworkLogger: NSObject, @unchecked Sendable {
     private let sensitiveKeyPatterns: [String] = [
         "password", "token", "pet", "spd", "authcode", "securitycode",
         "dsid", "dspersonid", "directoryservicesid", "actionsignature", "secret",
-        "identitytoken", "authorization", "cookie", "setcookie", "xappleimd", "dpinfo", "sinf"
+        "identitytoken", "authorization", "cookie", "setcookie", "xappleimd", "dpinfo", "sinf", "kbsync"
     ]
 
     private let redactedPlaceholder = "***REDACTED***"

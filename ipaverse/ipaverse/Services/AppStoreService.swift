@@ -482,24 +482,38 @@ final class AppStoreService: AppStoreServiceProtocol {
             }
             return try AppStoreDownloadProduct.catalogVersionID(data: data, appID: app.id ?? 0)
         }
-        if versionID == nil || versionID == "" {
-            let selectedVersion = try await latestVersionID()
+        var selectedVersion = versionID ?? ""
+        if selectedVersion.isEmpty {
+            selectedVersion = try await latestVersionID()
             request.httpBody = try AppStoreDownloadProduct.body(appID: app.id ?? 0, guid: guid, versionID: selectedVersion)
         }
         let updateEndpoint: (() async throws -> URL?)? = (app.platform == nil || app.platform == .ios || app.platform == .ipados || app.platform == .macos)
             ? { bagUpdateEndpoint } : nil
+        // ent/download and the redownload fallback share one bag request.
+        var fetchedBag: [String: Any]?
+        func urlBag() async throws -> [String: Any] {
+            if let fetchedBag { return fetchedBag }
+            var bagRequest = URLRequest(url: URL(string: "https://\(Constant.privateInitDomain)\(Constant.privateInitPath)")!)
+            bagRequest.setValue(Constant.defaultUserAgent, forHTTPHeaderField: "User-Agent")
+            logger.logRequest(bagRequest)
+            let (data, response) = try await session.data(for: bagRequest)
+            logger.logResponse(response, data: data, error: nil)
+            guard let http = response as? HTTPURLResponse else { throw LoginError.networkError }
+            guard http.statusCode == 200 else { throw AppStoreDownloadProductError.http(http.statusCode) }
+            guard let plist = try? PropertyListSerialization.propertyList(from: normalizePlistData(data), format: nil) as? [String: Any],
+                  let bag = plist["urlBag"] as? [String: Any] else {
+                throw AppStoreDownloadProductError.invalidEndpoint
+            }
+            fetchedBag = bag
+            return bag
+        }
         do {
+            if let item = try await entDownloadItem(app: app, account: account, guid: guid, versionID: selectedVersion, bag: urlBag) {
+                return item
+            }
             let item = try await AppStoreDownloadProduct.item(request: request, redownloadEndpoint: {
-                var bagRequest = URLRequest(url: URL(string: "https://\(Constant.privateInitDomain)\(Constant.privateInitPath)")!)
-                bagRequest.setValue(Constant.defaultUserAgent, forHTTPHeaderField: "User-Agent")
-                self.logger.logRequest(bagRequest)
-                let (data, response) = try await self.session.data(for: bagRequest)
-                self.logger.logResponse(response, data: data, error: nil)
-                guard let http = response as? HTTPURLResponse else { throw LoginError.networkError }
-                guard http.statusCode == 200 else { throw AppStoreDownloadProductError.http(http.statusCode) }
-                guard let plist = try? PropertyListSerialization.propertyList(from: self.normalizePlistData(data), format: nil) as? [String: Any],
-                      let bag = plist["urlBag"] as? [String: Any],
-                      let endpoint = bag["redownloadProduct"] as? String,
+                let bag = try await urlBag()
+                guard let endpoint = bag["redownloadProduct"] as? String,
                       let url = URL(string: endpoint) else {
                     throw AppStoreDownloadProductError.invalidEndpoint
                 }
@@ -525,6 +539,63 @@ final class AppStoreService: AppStoreServiceProtocol {
             if code == Constant.failureTypeLicenseNotFound || code == Constant.failureTypeTermsPageRedirect { throw LoginError.licenseRequired }
             throw AppStoreDownloadProductError.failure(code: code, message: message)
         }
+    }
+
+    /// Apple's bag maps volumeStoreDownloadProduct to DownloadDispatch's ent/download, which needs
+    /// kbsync (IPAtool 3411d57). In October 2026 the volume store answered without items and the
+    /// redownload fallback with HTTP 403. Returns nil when ent/download cannot serve the request,
+    /// so the volume-store chain still runs. License and session failures are thrown.
+    private func entDownloadItem(app: AppStoreApp, account: Account, guid: String, versionID: String,
+                                 bag: () async throws -> [String: Any]) async throws -> [String: Any]? {
+        guard let appID = app.id, appID > 0,
+              let dsid = UInt64(account.directoryServicesID), dsid != 0,
+              let hardwareID = try? MacPackage.hardwareID(guid: guid), hardwareID.count == 6 else { return nil }
+        let endpoint: URL
+        do {
+            guard let value = try await bag()["volumeStoreDownloadProduct"] as? String, let url = URL(string: value),
+                  AppStoreDownloadProduct.isSupportedEntDownloadEndpoint(url) else { return nil }
+            endpoint = url
+        } catch {
+            try Task.checkCancellation()
+            print("⬇️ [ent/download] bag unavailable (\(error.localizedDescription)) — using the volume store")
+            return nil
+        }
+        for attempt in 1...2 {
+            let kbsync: EntDownloadKBSync.Blob
+            do {
+                kbsync = try await EntDownloadKBSync.shared.blob(dsid: dsid, guid: guid, hardwareID: hardwareID)
+            } catch {
+                try Task.checkCancellation()
+                print("⬇️ [ent/download] kbsync unavailable (\(error.localizedDescription)) — using the volume store")
+                return nil
+            }
+            do {
+                let request = try AppStoreDownloadProduct.entDownloadRequest(
+                    endpoint: endpoint, appID: appID, guid: guid, hardwareID: hardwareID, versionID: versionID,
+                    kbsync: kbsync.base64, storeFront: account.storeFront,
+                    passwordToken: account.passwordToken, dsid: account.directoryServicesID)
+                logger.logRequest(request)
+                // X-Token must not follow a redirect.
+                let (data, response) = try await session.data(for: request, delegate: RefuseRedirectsDelegate())
+                logger.logResponse(response, data: data, error: nil)
+                let item = try AppStoreDownloadProduct.entDownloadItem(data: normalizePlistData(data), response: response,
+                                                                       appID: appID, versionID: versionID, bundleID: app.bundleID)
+                if app.platform == .macos { _ = try MacPackage.dpInfo(from: item) }
+                return item
+            } catch {
+                try Task.checkCancellation()
+                var code: String?
+                if case AppStoreDownloadProductError.failure(let failure, _) = error { code = failure }
+                // The app needs a license first; the kbsync itself was not rejected.
+                if code == Constant.failureTypeLicenseNotFound || code == Constant.failureTypeTermsPageRedirect { throw error }
+                await EntDownloadKBSync.shared.invalidate(dsid: dsid, guid: guid, base64: kbsync.base64)
+                if kbsync.isCached && attempt == 1 { continue }
+                if let code, Constant.authFailureCodes.contains(code) { throw error }
+                print("⬇️ [ent/download] \(error.localizedDescription) — using the volume store")
+                return nil
+            }
+        }
+        return nil
     }
 
     private func performDownload(app: AppStoreApp, account: Account, outputPath: String?, externalVersionId: String? = nil, progress: ((Double, Int64, Int64) -> Void)? = nil) async throws -> DownloadOutput {
@@ -999,6 +1070,19 @@ final class AppStoreURLSessionDelegate: NSObject, URLSessionTaskDelegate {
     }
 
 
+}
+
+/// Returns a redirect response as is, so the request's account headers stay with Apple's host.
+private final class RefuseRedirectsDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
 }
 
 // MARK: - CONSTANT
