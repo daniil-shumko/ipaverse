@@ -518,13 +518,26 @@ private enum AnisetteTests {
         for (identity, expectedRequests) in [("rate-limited-identity", 1), ("sms-rate-limited-identity", 2)] {
             let before = AppleURLProtocol.requests.count
             do {
-                _ = try await gsa.requestTwoFactorCode(identityToken: identity)
+                _ = try await gsa.requestTwoFactorCode(identityToken: identity, sendSMS: true)
                 throw Failure(message: "Claimed verification code was sent after HTTP 429")
             } catch GSAError.rateLimited {}
             try expect(AppleURLProtocol.requests.count == before + expectedRequests, "Retried rate-limited code request")
         }
+        // The verification page lists a trusted number even when the account has trusted
+        // devices; that must not text the user on top of the device prompt.
+        before = AppleURLProtocol.requests.count
+        let delivery = try await gsa.requestTwoFactorCode(identityToken: "sms-rate-limited-identity", sendSMS: false)
+        try expect(delivery == TwoFactorDelivery(trustedPhoneId: 1), "Trusted-device code request lost the SMS alternative")
+        try expect(AppleURLProtocol.requests.count == before + 1, "Trusted-device code request also sent an SMS")
+        before = AppleURLProtocol.requests.count
         do {
-            _ = try await gsa.requestTwoFactorCode(identityToken: "failure-identity")
+            _ = try await gsa.sendSMSCode(phoneId: 1, identityToken: "sms-rate-limited-identity")
+            throw Failure(message: "Claimed SMS was sent after HTTP 429")
+        } catch GSAError.rateLimited {}
+        try expect(AppleURLProtocol.requests.count == before + 1 && AppleURLProtocol.requests.last?.url?.path == "/auth/verify/phone/1/put",
+                   "SMS on request did not go straight to the phone endpoint")
+        do {
+            _ = try await gsa.requestTwoFactorCode(identityToken: "failure-identity", sendSMS: false)
             throw Failure(message: "Claimed verification code was sent after HTTP 503")
         } catch GSAError.serverError(503, _) {}
         print("PASS: GSA init/complete and all 2FA paths reject HTTP 429 without retrying")

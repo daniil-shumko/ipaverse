@@ -14,8 +14,13 @@ import IOKit
 protocol AppStoreServiceProtocol {
     func login(credentials: LoginCredentials) async throws -> Account
     /// Requests a fresh 2FA code for the sign-in currently awaiting one, without
-    /// repeating the SRP handshake. See `AppStoreService.resendTwoFactorCode()`.
-    func resendTwoFactorCode() async throws -> (phoneId: Int?, maskedPhone: String?)
+    /// repeating the SRP handshake, by the method used last. Returns the masked phone
+    /// number when the code goes out by SMS. See `AppStoreService.resendTwoFactorCode()`.
+    func resendTwoFactorCode() async throws -> String?
+    /// Sends the pending sign-in's code by SMS instead of to trusted devices.
+    func sendTwoFactorCodeBySMS() async throws -> String?
+    /// Whether the pending sign-in can switch to an SMS code.
+    var canSendTwoFactorCodeBySMS: Bool { get }
     func hasValidTokenFormat(_ token: String) async throws -> Bool
     func logout() async throws
     func search(term: String, account: Account, limit: Int, platform: AppPlatform) async throws -> SearchResult
@@ -34,11 +39,11 @@ final class AppStoreService: AppStoreServiceProtocol {
     let sessionDelegate: AppStoreURLSessionDelegate
 
     /// GrandSlam 2FA context from a verification-pending handshake, used to validate
-    /// the code the user subsequently enters. `phoneId` is set when the code is
-    /// delivered via SMS (no trusted device).
+    /// the code the user subsequently enters. `delivery.smsPhoneId` is set when the
+    /// code is delivered via SMS.
     private struct PendingGSATwoFactor {
         let identityToken: String
-        var phoneId: Int?
+        var delivery: TwoFactorDelivery
         let email: String
         let configuration: AnisetteConfiguration
         let anisette: AnisetteSession
@@ -105,7 +110,8 @@ final class AppStoreService: AppStoreServiceProtocol {
             // GrandSlam identity before re-running the handshake (now trusted).
             if let code = credentials.authCode, let pending = pendingGSATwoFactor, !pending.isVerified {
                 do {
-                    try await gsa.submitTwoFactorCode(code, identityToken: pending.identityToken, phoneId: pending.phoneId)
+                    try await gsa.submitTwoFactorCode(code, identityToken: pending.identityToken,
+                                                      phoneId: pending.delivery.smsPhoneId)
                 } catch GSAError.serverError(let code, _) where !(500...599).contains(code) {
                     throw LoginError.invalidAuthCode
                 }
@@ -131,12 +137,12 @@ final class AppStoreService: AppStoreServiceProtocol {
                 }
                 throw error
             }
-        } catch let GSAError.needsTwoFactor(identity, phoneId, maskedPhone) {
-            pendingGSATwoFactor = PendingGSATwoFactor(identityToken: identity, phoneId: phoneId,
+        } catch let GSAError.needsTwoFactor(identity, delivery) {
+            pendingGSATwoFactor = PendingGSATwoFactor(identityToken: identity, delivery: delivery,
                                                      email: email, configuration: configuration, anisette: anisette)
             // If we already submitted a code and 2FA is still required, the code
             // was wrong/expired — prompt again rather than claiming success.
-            throw submittingCode ? LoginError.invalidAuthCode : LoginError.twoFactorRequired(maskedPhone: maskedPhone)
+            throw submittingCode ? LoginError.invalidAuthCode : LoginError.twoFactorRequired(maskedPhone: delivery.maskedPhone)
         } catch let GSAError.serverError(code, message) {
             // Apple GSA error codes for bad credentials.
             if code == -20101 || code == -22406 || code == -36607 {
@@ -161,14 +167,37 @@ final class AppStoreService: AppStoreServiceProtocol {
     /// gsa.apple.com that could itself come back rate-limited (see GitHub issue #12,
     /// "re-sending results in an error"). This calls the trusted-device/SMS endpoint
     /// directly instead.
-    func resendTwoFactorCode() async throws -> (phoneId: Int?, maskedPhone: String?) {
+    func resendTwoFactorCode() async throws -> String? {
         guard let pending = pendingGSATwoFactor else {
             throw LoginError.unknownError("There is no pending two-factor sign-in to resend a code for.")
         }
         let gsa = GSAClient(session: session, anisette: pending.anisette)
-        let info = try await gsa.requestTwoFactorCode(identityToken: pending.identityToken)
-        pendingGSATwoFactor?.phoneId = info.phoneId
-        return info
+        let delivery: TwoFactorDelivery
+        if let phoneId = pending.delivery.smsPhoneId {
+            delivery = try await gsa.sendSMSCode(phoneId: phoneId, identityToken: pending.identityToken)
+        } else {
+            delivery = try await gsa.requestTwoFactorCode(identityToken: pending.identityToken, sendSMS: false)
+        }
+        pendingGSATwoFactor?.delivery = delivery
+        return delivery.maskedPhone
+    }
+
+    var canSendTwoFactorCodeBySMS: Bool {
+        pendingGSATwoFactor.map { $0.delivery.smsPhoneId == nil } ?? false
+    }
+
+    /// The "text me a code instead" path for a sign-in whose code went to trusted devices.
+    func sendTwoFactorCodeBySMS() async throws -> String? {
+        guard let pending = pendingGSATwoFactor else {
+            throw LoginError.unknownError("There is no pending two-factor sign-in to send a code for.")
+        }
+        let gsa = GSAClient(session: session, anisette: pending.anisette)
+        // A 409 sign-in never fetched the verification page; Apple numbers the primary
+        // trusted phone 1, which is also what AltSign sends.
+        let delivery = try await gsa.sendSMSCode(phoneId: pending.delivery.trustedPhoneId ?? 1,
+                                                 identityToken: pending.identityToken)
+        pendingGSATwoFactor?.delivery = delivery
+        return delivery.maskedPhone
     }
 
     /// Exchanges a successful GrandSlam identity for the App Store credentials

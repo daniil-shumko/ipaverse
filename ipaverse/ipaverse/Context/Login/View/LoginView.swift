@@ -308,6 +308,16 @@ struct LoginView: View {
                     .foregroundColor(.secondary.opacity(0.7))
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
+
+                if viewModel.canSendCodeBySMS {
+                    Button("Text me a code instead") {
+                        Task { await viewModel.sendCodeBySMS() }
+                    }
+                    .buttonStyle(.link)
+                    .font(.system(size: 12, weight: .medium))
+                    .disabled(viewModel.isLoading)
+                    .frame(maxWidth: .infinity)
+                }
             }
         }
         .padding(.vertical, 8)
