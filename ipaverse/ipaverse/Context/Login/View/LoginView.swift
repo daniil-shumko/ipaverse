@@ -78,8 +78,8 @@ struct LoginView: View {
 
     private var signInServiceNotice: some View {
         let mode = AnisetteConfiguration.Mode(rawValue: anisetteMode) ?? .automatic
-        let host = URLComponents(string: anisetteServer)?.host
-        let service = host == "ani.sidestore.zip" ? "SideStore" : (host ?? "the configured service")
+        let host = URLComponents(string: AnisetteConfiguration.resolvedServer(anisetteServer))?.host
+        let service = host ?? "the configured service"
         return Group {
             if mode != .local {
                 Text(mode == .remote

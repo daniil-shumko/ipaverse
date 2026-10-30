@@ -266,6 +266,11 @@ private enum AnisetteTests {
             let saved = AnisetteConfiguration.load(from: defaults)
             try expect(saved.mode == mode && saved.server == testServer.absoluteString, "Existing sign-in preferences overwritten")
         }
+        for retired in ["https://ani.sidestore.zip", "https://ANI.sidestore.zip/"] {
+            defaults.setVolatileDomain([AnisetteConfiguration.serverKey: retired], forName: UserDefaults.argumentDomain)
+            try expect(AnisetteConfiguration.load(from: defaults).server == AnisetteConfiguration.defaultServer,
+                       "A saved retired default must resolve to the current default server")
+        }
         defaults.setVolatileDomain([AnisetteConfiguration.modeKey: "unknown"], forName: UserDefaults.argumentDomain)
         try expect(AnisetteConfiguration.load(from: defaults).mode == .automatic, "Invalid mode must use automatic default")
         defaults.removeVolatileDomain(forName: UserDefaults.argumentDomain)
